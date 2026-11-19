@@ -139,7 +139,7 @@ fn fill_scores_fast_row_scalar(
     sc_n: i8,
     s: &mut [i8],
 ) {
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = (st0 + ((en0 - st0) / 16 + 1) * 16).min(tlen_pad);
     for idx in st0..end {
         let sq = sfqr[idx];
@@ -163,7 +163,7 @@ fn fill_scores_fast_row_scalar(
 // ends after `st0 + 16k`; the cells outside keep their previous contents.
 
 /// `LOW_BYTES[16 - n..]` starts with `n` bytes set, for `n` in `0..=16`.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 static LOW_BYTES: [i8; 32] = {
     let mut m = [0i8; 32];
     let mut i = 0;
@@ -198,8 +198,8 @@ unsafe fn fill_scores_partial_block_sse41<const KEEP_LOW: bool>(
     use std::arch::x86_64::*;
 
     let wc = _mm_set1_epi8(wildcard as i8);
-    let qpos = (s.len() as isize + qrr_base as isize + t as isize) as usize;
-    debug_assert!(n <= 16 && t + 16 <= s.len() && qpos + 16 <= sfqr.len());
+    let qpos = ((s.len() - S_SLACK) as isize + qrr_base as isize + t as isize) as usize;
+    debug_assert!(n <= 16 && t + 16 <= s.len() - S_SLACK && qpos + 16 <= sfqr.len());
     // SAFETY: both loads are inside `sfqr`, `sp` inside `s` (see above).
     let sq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(t) as *const __m128i) };
     let qq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(qpos) as *const __m128i) };
@@ -238,7 +238,7 @@ unsafe fn fill_scores_fast_row_avx2(
 ) {
     use std::arch::x86_64::*;
 
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = st0 + ((en0 - st0) / 16 + 1) * 16;
     let lim = end.min(tlen_pad);
     // The last byte any block below reads from `qr` is at most cell
@@ -334,7 +334,7 @@ unsafe fn fill_scores_fast_row_sse41(
 ) {
     use std::arch::x86_64::*;
 
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = st0 + ((en0 - st0) / 16 + 1) * 16;
     let lim = end.min(tlen_pad);
     // see `fill_scores_fast_row_avx2`
@@ -406,44 +406,6 @@ unsafe fn fill_scores_fast_row_sse41(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn fill_scores_partial_block_neon<const KEEP_LOW: bool>(
-    sfqr: &[u8],
-    qrr_base: i32,
-    t: usize,
-    n: usize,
-    wildcard: u8,
-    sc_mch: i8,
-    sc_mis: i8,
-    sc_n: i8,
-    s: &mut [i8],
-) {
-    use std::arch::aarch64::*;
-
-    let wc = vdupq_n_u8(wildcard);
-    let qpos = (s.len() as isize + qrr_base as isize + t as isize) as usize;
-    debug_assert!(n <= 16 && t + 16 <= s.len() && qpos + 16 <= sfqr.len());
-    // SAFETY: both loads are inside `sfqr`, `sp` inside `s` (see above).
-    let sq = unsafe { vld1q_u8(sfqr.as_ptr().add(t)) };
-    let qq = unsafe { vld1q_u8(sfqr.as_ptr().add(qpos)) };
-    let sp = unsafe { s.as_mut_ptr().add(t) };
-    let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-    let eq = vceqq_u8(sq, qq);
-    let tmp = vbslq_s8(eq, vdupq_n_s8(sc_mch), vdupq_n_s8(sc_mis));
-    let tmp = vbslq_s8(mask_wc, vdupq_n_s8(sc_n), tmp);
-    // SAFETY: `16 - n..16 - n + 16` is inside the 32-byte table.
-    let low = unsafe { vld1q_u8(LOW_BYTES.as_ptr().add(16 - n) as *const u8) };
-    let old = unsafe { vld1q_s8(sp) };
-    let tmp = if KEEP_LOW {
-        vbslq_s8(low, old, tmp)
-    } else {
-        vbslq_s8(low, tmp, old)
-    };
-    unsafe { vst1q_s8(sp, tmp) };
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[inline]
 unsafe fn fill_scores_fast_row_neon(
     sfqr: &[u8],
     qrr_base: i32,
@@ -457,9 +419,8 @@ unsafe fn fill_scores_fast_row_neon(
 ) {
     use std::arch::aarch64::*;
 
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = st0 + ((en0 - st0) / 16 + 1) * 16;
-    let lim = end.min(tlen_pad);
     // see `fill_scores_fast_row_avx2`
     assert!(
         st0 <= en0
@@ -468,56 +429,24 @@ unsafe fn fill_scores_fast_row_neon(
             && tlen_pad + (qrr_base + en0 as i32) as usize + 31 <= sfqr.len()
     );
 
-    let mut t = st0 & !15;
-    if t < st0 {
-        // SAFETY: `t < st0 <= en0 < tlen_pad` and the bounds asserted above.
-        unsafe {
-            fill_scores_partial_block_neon::<true>(
-                sfqr,
-                qrr_base,
-                t,
-                st0 - t,
-                wildcard,
-                sc_mch,
-                sc_mis,
-                sc_n,
-                s,
-            )
-        };
-        t += 16;
-    }
     let wc = vdupq_n_u8(wildcard);
     let mch = vdupq_n_s8(sc_mch);
     let mis = vdupq_n_s8(sc_mis);
     let nsc = vdupq_n_s8(sc_n);
-    while t + 16 <= lim {
+    // aarch64 keeps v0.2.1's unaligned chunks from `st0`, written whole into
+    // the slack past `tlen_pad`: on Apple cores a load spanning two stores is
+    // forwarded cheaply, so aligning or clipping the blocks only adds work.
+    assert!(end <= s.len());
+    let mut t = st0;
+    while t < end {
         let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
-        // SAFETY: `st0 <= t` and `t + 16 <= lim`: all 16 cells are inside
-        // `[st0, end)` and `s`, and the loads inside `sfqr` (asserted above).
         let sq = unsafe { vld1q_u8(sfqr.as_ptr().add(t)) };
         let qq = unsafe { vld1q_u8(sfqr.as_ptr().add(qpos)) };
         let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-        let eq = vceqq_u8(sq, qq);
-        let tmp = vbslq_s8(eq, mch, mis);
-        let tmp = vbslq_s8(mask_wc, nsc, tmp);
+        let tmp = vbslq_s8(mask_wc, nsc, vbslq_s8(vceqq_u8(sq, qq), mch, mis));
+        // SAFETY: `t + 16 <= end <= s.len()`; both loads are inside `sfqr` (asserted above).
         unsafe { vst1q_s8(s.as_mut_ptr().add(t), tmp) };
         t += 16;
-    }
-    if t < lim {
-        // SAFETY: `t` is a multiple of 16 below `lim <= tlen_pad`.
-        unsafe {
-            fill_scores_partial_block_neon::<false>(
-                sfqr,
-                qrr_base,
-                t,
-                end - t,
-                wildcard,
-                sc_mch,
-                sc_mis,
-                sc_n,
-                s,
-            )
-        };
     }
 }
 
@@ -1399,138 +1328,73 @@ unsafe fn update_h_exact_lanes_neon(
     } else {
         h[en0] + i32::from(v[en0]) - qe
     };
-    let lo = st0 & !3;
-    let hi = en0 & !3;
-    assert!(st0 <= en0 && hi + 4 <= h.len() && hi + 4 <= v.len());
-
+    h[en0] = h_en;
     let qe_v = vdupq_n_s32(qe);
     let lane = unsafe { vld1q_s32([0i32, 1, 2, 3].as_ptr()) };
-    let st_m1 = vdupq_n_s32(st0 as i32 - 1);
-    let en_v = vdupq_n_s32(en0 as i32);
-    let hen_v = vdupq_n_s32(h_en);
+    let base = vaddq_s32(vdupq_n_s32(st0 as i32), lane);
+    let mut idx = [base, vaddq_s32(base, vdupq_n_s32(4)), vaddq_s32(base, vdupq_n_s32(8)), vaddq_s32(base, vdupq_n_s32(12))];
+    let sixteen = vdupq_n_s32(16);
     let mut mx = [vdupq_n_s32(i32::MIN); 4];
     let mut mt = [vdupq_n_s32(i32::MAX); 4];
-
-    // The four cells of `v` at `g`, widened.
-    macro_rules! v_group {
-        ($g:expr) => {{
-            // SAFETY: the group is inside `v` (asserted above).
-            let v4 = unsafe { (v.as_ptr().add($g) as *const u32).read_unaligned() };
-            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(
-                vdup_n_u32(v4),
-            )))))
-        }};
-    }
-    // The group at `g` when it holds `st0` or `en0`: the cells in
-    // `[st0, en0)` are updated and enter accumulator 0, `h[en0]` is set, the
-    // others are stored back as they were.
-    macro_rules! masked_group {
-        ($g:expr) => {{
-            let g: usize = $g;
-            // SAFETY: `g <= hi`, so the group is inside `h` and `v` (asserted).
-            let hp = unsafe { h.as_mut_ptr().add(g) };
-            let hv = unsafe { vld1q_s32(hp) };
-            let nh = vsubq_s32(vaddq_s32(hv, v_group!(g)), qe_v);
-            let pos = vaddq_s32(vdupq_n_s32(g as i32), lane);
-            let inside = vandq_u32(vcgtq_s32(pos, st_m1), vcgtq_s32(en_v, pos));
-            let out = vbslq_s32(inside, nh, hv);
-            let out = vbslq_s32(vceqq_s32(pos, en_v), hen_v, out);
-            unsafe { vst1q_s32(hp, out) };
-            let take = vandq_u32(inside, vcgtq_s32(nh, mx[0]));
-            mx[0] = vbslq_s32(take, nh, mx[0]);
-            mt[0] = vbslq_s32(take, pos, mt[0]);
-        }};
-    }
-    // A group wholly inside `[st0, en0)`, into accumulator 0.
-    macro_rules! whole_group {
-        ($g:expr) => {{
-            let g: usize = $g;
-            // SAFETY: `g + 4 <= en0`, within both `h` and `v` (asserted above).
-            let hp = unsafe { h.as_mut_ptr().add(g) };
-            let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, v_group!(g)), qe_v);
-            unsafe { vst1q_s32(hp, nh) };
-            let take = vcgtq_s32(nh, mx[0]);
-            mx[0] = vbslq_s32(take, nh, mx[0]);
-            mt[0] = vbslq_s32(take, vaddq_s32(vdupq_n_s32(g as i32), lane), mt[0]);
-        }};
-    }
-
-    let mut g = lo;
-    if g < st0 {
-        masked_group!(g);
-        g += 4;
-    }
-    // Whole groups up to the first whole 16-cell block...
-    while g + 4 <= en0 && (g & 15 != 0 || g + 16 > en0) {
-        whole_group!(g);
-        g += 4;
-    }
-    // ...the whole blocks, four groups at a time...
-    let wide = g + 16 <= en0;
-    if wide {
-        let base = vaddq_s32(vdupq_n_s32(g as i32), lane);
-        let mut idx = [
-            base,
-            vaddq_s32(base, vdupq_n_s32(4)),
-            vaddq_s32(base, vdupq_n_s32(8)),
-            vaddq_s32(base, vdupq_n_s32(12)),
+    let mut t = st0;
+    assert!(en0 <= v.len() && en0 <= h.len());
+    while t + 16 <= en0 {
+        // SAFETY: `t + 16 <= en0`, within both `h` and `v` (asserted above).
+        let vb = unsafe { vld1q_u8(v.as_ptr().add(t)) };
+        let (w_lo, w_hi) = (vmovl_u8(vget_low_u8(vb)), vmovl_high_u8(vb));
+        let vw = [
+            vmovl_u16(vget_low_u16(w_lo)),
+            vmovl_high_u16(w_lo),
+            vmovl_u16(vget_low_u16(w_hi)),
+            vmovl_high_u16(w_hi),
         ];
-        let sixteen = vdupq_n_s32(16);
-        while g + 16 <= en0 {
-            // SAFETY: `g + 16 <= en0`, within both `h` and `v` (asserted above).
-            let vb = unsafe { vld1q_u8(v.as_ptr().add(g)) };
-            let (w_lo, w_hi) = (vmovl_u8(vget_low_u8(vb)), vmovl_high_u8(vb));
-            let vw = [
-                vmovl_u16(vget_low_u16(w_lo)),
-                vmovl_high_u16(w_lo),
-                vmovl_u16(vget_low_u16(w_hi)),
-                vmovl_high_u16(w_hi),
-            ];
-            for k in 0..4 {
-                let hp = unsafe { h.as_mut_ptr().add(g + 4 * k) };
-                let nh = vsubq_s32(
-                    vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw[k])),
-                    qe_v,
-                );
-                unsafe { vst1q_s32(hp, nh) };
-                let take = vcgtq_s32(nh, mx[k]);
-                mx[k] = vbslq_s32(take, nh, mx[k]);
-                mt[k] = vbslq_s32(take, idx[k], mt[k]);
-                idx[k] = vaddq_s32(idx[k], sixteen);
-            }
-            g += 16;
+        for k in 0..4 {
+            let hp = unsafe { h.as_mut_ptr().add(t + 4 * k) };
+            let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw[k])), qe_v);
+            unsafe { vst1q_s32(hp, nh) };
+            let take = vcgtq_s32(nh, mx[k]);
+            mx[k] = vbslq_s32(take, nh, mx[k]);
+            mt[k] = vbslq_s32(take, idx[k], mt[k]);
+            idx[k] = vaddq_s32(idx[k], sixteen);
         }
-        // ...and the whole groups after them. Accumulator 0 still sees its
-        // positions in increasing order, so it still keeps the first maximum.
-        while g + 4 <= en0 {
-            whole_group!(g);
-            g += 4;
-        }
+        t += 16;
     }
-    // The group of `en0`, unless it was also the group of `st0`.
-    if g <= hi {
-        masked_group!(g);
+    // Then 4 cells at a time into the first accumulator: each lane still sees
+    // its positions in increasing order, so it still keeps the first maximum.
+    let mut idx4 = vaddq_s32(vdupq_n_s32(t as i32), lane);
+    while t + 4 <= en0 {
+        // SAFETY: `t + 4 <= en0`, within both `h` and `v` (asserted above).
+        let v4 = unsafe { (v.as_ptr().add(t) as *const u32).read_unaligned() };
+        let vw = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(v4)))));
+        let hp = unsafe { h.as_mut_ptr().add(t) };
+        let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw)), qe_v);
+        unsafe { vst1q_s32(hp, nh) };
+        let take = vcgtq_s32(nh, mx[0]);
+        mx[0] = vbslq_s32(take, nh, mx[0]);
+        mt[0] = vbslq_s32(take, idx4, mt[0]);
+        idx4 = vaddq_s32(idx4, vdupq_n_s32(4));
+        t += 4;
     }
-
-    let none = vdupq_n_s32(i32::MAX);
-    let (best, first);
-    if wide {
+    let (mut best, mut best_t) = (i32::MIN, i32::MAX);
+    if t > st0 {
         best = vmaxvq_s32(vmaxq_s32(vmaxq_s32(mx[0], mx[1]), vmaxq_s32(mx[2], mx[3])));
         let mv = vdupq_n_s32(best);
-        let mut f = none;
+        let none = vdupq_n_s32(i32::MAX);
+        let mut first = none;
         for k in 0..4 {
-            f = vminq_s32(f, vbslq_s32(vceqq_s32(mx[k], mv), mt[k], none));
+            first = vminq_s32(first, vbslq_s32(vceqq_s32(mx[k], mv), mt[k], none));
         }
-        first = f;
-    } else {
-        best = vmaxvq_s32(mx[0]);
-        first = vbslq_s32(vceqq_s32(mx[0], vdupq_n_s32(best)), mt[0], none);
+        best_t = vminvq_s32(first);
     }
-    if best > h_en {
-        (best, vminvq_s32(first))
-    } else {
-        (h_en, en0 as i32)
+    // The tail follows every position above, so strict `>` keeps them first.
+    for k in t..en0 {
+        h[k] += i32::from(v[k]) - qe;
+        if h[k] > best {
+            best = h[k];
+            best_t = k as i32;
+        }
     }
+    if best > h_en { (best, best_t) } else { (h_en, en0 as i32) }
 }
 
 #[inline(always)]
@@ -1734,11 +1598,16 @@ pub(super) trait BackendOps {
 
 /// Carve the flat `Workspace::buf` into the named DP slices.
 ///
-/// Layout: `[u | v | x | y | s | sf | qr+32]`, matching the C reference.
+/// Layout: `[u | v | x | y | s+16 | sf | qr+32]`, as in the C reference plus
+/// `S_SLACK` cells after `s`.
 /// The `s` slice is re-interpreted as `&mut [i8]` (same size/alignment as
 /// `u8`).  All returned slices are non-overlapping sub-slices of `buf`.
 /// `sf` and `qr` come back as one slice, `sfqr`: the score fill reads across
 /// their boundary (`sf` is `tlen_pad` long).
+/// Cells of `s` past `tlen_pad`: room for a whole 16-cell store from any
+/// `st0 < tlen_pad`. Never read by the DP kernels.
+pub(super) const S_SLACK: usize = 16;
+
 #[inline]
 pub(super) fn split_main_buf(
     buf: &mut [u8],
@@ -1756,10 +1625,10 @@ pub(super) fn split_main_buf(
     let (v, rest) = rest.split_at_mut(tlen_pad);
     let (x, rest) = rest.split_at_mut(tlen_pad);
     let (y, rest) = rest.split_at_mut(tlen_pad);
-    let (s_raw, rest) = rest.split_at_mut(tlen_pad);
+    let (s_raw, rest) = rest.split_at_mut(tlen_pad + S_SLACK);
     let (sfqr, _) = rest.split_at_mut(tlen_pad + qlen_pad + 32);
     // SAFETY: i8 has the same size and alignment as u8; the slice is valid.
-    let s = unsafe { std::slice::from_raw_parts_mut(s_raw.as_mut_ptr() as *mut i8, tlen_pad) };
+    let s = unsafe { std::slice::from_raw_parts_mut(s_raw.as_mut_ptr() as *mut i8, tlen_pad + S_SLACK) };
     (u, v, x, y, s, sfqr)
 }
 
@@ -2320,7 +2189,7 @@ impl BackendOps for NeonOps {
 // or the kernels (which do carry one) cannot be inlined into it and every
 // anti-diagonal pays three calls, with the glue compiled for the baseline.
 
-#[inline(always)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn extz2_core_score_only<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     if (input.flag & KSW_EZ_APPROX_MAX) != 0 {
         if (input.flag & KSW_EZ_RIGHT) != 0 {
@@ -2337,7 +2206,7 @@ fn extz2_core_score_only<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, w
     }
 }
 
-#[inline(always)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bool>(
     input: &Extz2Input<'_>,
     ez: &mut Extz,
@@ -2572,7 +2441,7 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
     }
 }
 
-#[inline(always)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: bool>(
     input: &Extz2Input<'_>,
     ez: &mut Extz,
@@ -2877,7 +2746,7 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
     }
 }
 
-#[inline(always)]
+#[cfg_attr(target_arch = "x86_64", inline(always))]
 pub(super) fn extz2_core<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     let with_cigar = (input.flag & KSW_EZ_SCORE_ONLY) == 0;
     if !with_cigar {

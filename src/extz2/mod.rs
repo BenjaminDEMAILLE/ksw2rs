@@ -148,7 +148,7 @@ pub struct Workspace {
 impl Workspace {
     /// Prepare the flat buffer for a score-only alignment.
     ///
-    /// Layout: `[u | v | x | y | s | sf | qr+32]`, all zero-initialised once.
+    /// Layout: `[u | v | x | y | s+16 | sf | qr+32]`, all zero-initialised once.
     /// The trailing 32-byte pad on `qr` (and the implicit pad provided by `qr`
     /// after `sf`) means SIMD score-fill kernels can always load whole blocks
     /// without a per-chunk bounds check.
@@ -157,7 +157,7 @@ impl Workspace {
         let tlen_pad = tlen.div_ceil(16) * 16;
         let qlen_pad = qlen.div_ceil(16) * 16;
         // 6 tlen_pad-wide arrays (u,v,x,y,s,sf) plus qr with a 32-byte pad.
-        let total = 6 * tlen_pad + qlen_pad + 32;
+        let total = 6 * tlen_pad + core::S_SLACK + qlen_pad + 32;
         self.buf.clear();
         self.buf.resize(total, 0u8);
         self.tlen_pad = tlen_pad;
