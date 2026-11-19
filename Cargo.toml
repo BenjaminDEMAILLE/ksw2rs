@@ -12,6 +12,11 @@ readme = "README.md"
 keywords = ["bioinformatics", "alignment", "simd", "ksw2", "sequence-alignment"]
 categories = ["science", "algorithms"]
 
+[features]
+# Experiment: on x86 use the unaligned whole-chunk score fill (as on aarch64)
+# instead of the block-aligned one, to compare the two on real x86 hardware.
+x86-unaligned-fill = []
+
 [dependencies]
 
 [build-dependencies]

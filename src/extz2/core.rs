@@ -164,6 +164,7 @@ fn fill_scores_fast_row_scalar(
 
 /// `LOW_BYTES[16 - n..]` starts with `n` bytes set, for `n` in `0..=16`.
 #[cfg(target_arch = "x86_64")]
+#[cfg_attr(feature = "x86-unaligned-fill", allow(dead_code))]
 static LOW_BYTES: [i8; 32] = {
     let mut m = [0i8; 32];
     let mut i = 0;
@@ -184,6 +185,7 @@ static LOW_BYTES: [i8; 32] = {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline]
+#[cfg_attr(feature = "x86-unaligned-fill", allow(dead_code))]
 unsafe fn fill_scores_partial_block_sse41<const KEEP_LOW: bool>(
     sfqr: &[u8],
     qrr_base: i32,
@@ -225,6 +227,7 @@ unsafe fn fill_scores_partial_block_sse41<const KEEP_LOW: bool>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
+#[cfg_attr(feature = "x86-unaligned-fill", allow(dead_code))]
 unsafe fn fill_scores_fast_row_avx2(
     sfqr: &[u8],
     qrr_base: i32,
@@ -321,6 +324,7 @@ unsafe fn fill_scores_fast_row_avx2(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline]
+#[cfg_attr(feature = "x86-unaligned-fill", allow(dead_code))]
 unsafe fn fill_scores_fast_row_sse41(
     sfqr: &[u8],
     qrr_base: i32,
@@ -395,6 +399,56 @@ unsafe fn fill_scores_fast_row_sse41(
                 s,
             )
         };
+    }
+}
+
+/// Unaligned variant of the x86 score fill (feature `x86-unaligned-fill`):
+/// the cells `[st0, st0 + 16k)` in whole 16-cell chunks from `st0`, as the
+/// NEON fill does, the last one into the slack past `tlen_pad`. Same cells of
+/// `s` below `tlen_pad` as the aligned fill.
+#[cfg(all(target_arch = "x86_64", feature = "x86-unaligned-fill"))]
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn fill_scores_fast_row_unaligned_sse41(
+    sfqr: &[u8],
+    qrr_base: i32,
+    st0: usize,
+    en0: usize,
+    wildcard: u8,
+    sc_mch: i8,
+    sc_mis: i8,
+    sc_n: i8,
+    s: &mut [i8],
+) {
+    use std::arch::x86_64::*;
+
+    let tlen_pad = s.len() - S_SLACK;
+    let end = st0 + ((en0 - st0) / 16 + 1) * 16;
+    // see `fill_scores_fast_row_avx2`
+    assert!(
+        st0 <= en0
+            && en0 < tlen_pad
+            && end <= s.len()
+            && qrr_base + st0 as i32 >= 0
+            && tlen_pad + (qrr_base + en0 as i32) as usize + 31 <= sfqr.len()
+    );
+
+    let wc = _mm_set1_epi8(wildcard as i8);
+    let mch = _mm_set1_epi8(sc_mch);
+    let mis = _mm_set1_epi8(sc_mis);
+    let nsc = _mm_set1_epi8(sc_n);
+    let mut t = st0;
+    while t < end {
+        let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
+        // SAFETY: `t + 16 <= end <= s.len()`; both loads are inside `sfqr` (asserted above).
+        let sq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(t) as *const __m128i) };
+        let qq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(qpos) as *const __m128i) };
+        let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, wc), _mm_cmpeq_epi8(qq, wc));
+        let eq = _mm_cmpeq_epi8(sq, qq);
+        let mut tmp = _mm_blendv_epi8(mis, mch, eq);
+        tmp = _mm_blendv_epi8(tmp, nsc, mask_wc);
+        unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
+        t += 16;
     }
 }
 
@@ -1781,9 +1835,13 @@ impl BackendOps for Sse41Ops {
         sc_n: i8,
         s: &mut [i8],
     ) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "x86-unaligned-fill")))]
         unsafe {
             fill_scores_fast_row_sse41(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "x86-unaligned-fill"))]
+        unsafe {
+            fill_scores_fast_row_unaligned_sse41(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
         }
         #[cfg(not(target_arch = "x86_64"))]
         fill_scores_fast_row_scalar(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
@@ -1942,9 +2000,13 @@ impl BackendOps for Avx2Ops {
         sc_n: i8,
         s: &mut [i8],
     ) {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_arch = "x86_64", not(feature = "x86-unaligned-fill")))]
         unsafe {
             fill_scores_fast_row_avx2(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "x86-unaligned-fill"))]
+        unsafe {
+            fill_scores_fast_row_unaligned_sse41(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
         }
         #[cfg(not(target_arch = "x86_64"))]
         fill_scores_fast_row_scalar(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
